@@ -7,6 +7,7 @@ function Home() {
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
   const [author, setAuthor] = useState("");
+  const [postId, setPostId] = useState(""); // 조회할 게시글 ID
 
   // 웹소켓 연결
   useEffect(() => {
@@ -40,12 +41,21 @@ function Home() {
   // 게시글 생성
   const createPost = () => {
     if (socket && title && content && author) {
-      const post = { title, content, author };
+      const post = { action: "insert",title, content, author };
       const postMessage = JSON.stringify(post);
       socket.send(postMessage);
       console.log("Sent post:", post);
     }
   };
+  // 게시글 조회
+  const getPost = () => {
+    if (socket && postId) {
+      const request = { action: "retrieve", id: postId };
+      socket.send(JSON.stringify(request));
+      console.log("Sent get_post request:", request);
+    }
+  };
+
 
   return (
       <div className="App">
@@ -82,6 +92,16 @@ function Home() {
               <p>Author: {postData.author}</p>
             </div>
         )}
+        {/* 게시글 조회 폼 */}
+        <div>
+          <input
+              type="text"
+              placeholder="Post ID"
+              value={postId}
+              onChange={(e) => setPostId(e.target.value)}
+          />
+          <button onClick={getPost}>Get Post</button>
+        </div>
       </div>
   );
 }

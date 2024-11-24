@@ -7,6 +7,7 @@ import (
 	storetypes "cosmossdk.io/store/types"
 	"encoding/json"
 	"fmt"
+	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	db "github.com/cosmos/cosmos-db"
 	"github.com/cosmos/cosmos-sdk/codec"
 	codeType "github.com/cosmos/cosmos-sdk/codec/types"
@@ -14,7 +15,10 @@ import (
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -27,6 +31,8 @@ type Post struct {
 	Author    string `protobuf:"bytes,4,opt,name=author,proto3" json:"author"`
 	Timestamp int64  `protobuf:"varint,5,opt,name=timestamp,proto3" json:"timestamp"`
 }
+
+var logger log.Logger
 
 func (p *Post) Reset()         { *p = Post{} }
 func (p *Post) String() string { return fmt.Sprintf("Post ID: %d, Title: %s", p.ID, p.Title) }
@@ -87,6 +93,8 @@ func (k ForumKeeper) GetPost(ctx types.Context, id int64) (*Post, bool) {
 	}
 	var post Post
 	k.cdc.MustUnmarshal(store.Get(key), &post)
+
+	fmt.Println(post)
 	return &post, true
 }
 
@@ -99,7 +107,89 @@ var clients = make(map[*websocket.Conn]bool)
 var broadcast = make(chan string)
 var mu sync.Mutex
 
-// WebSocket 연결을 처리하는 함수
+/*memdb 생성*/
+//func createContext(k ForumKeeper) sdk.Context {
+//	// 메모리 데이터베이스 생성
+//	db := db.NewMemDB()
+//	logger := log.NewNopLogger()
+//	metricGatherer := metrics.NewNoOpMetrics()
+//
+//	// MultiStore 생성
+//	ms := store.NewCommitMultiStore(db, logger, metricGatherer)
+//
+//	// Forum 스토어 키 등록
+//	ms.MountStoreWithDB(k.storeKey, storetypes.StoreTypeIAVL, nil)
+//
+//	// MultiStore 초기화
+//	if err := ms.LoadLatestVersion(); err != nil {
+//		panic(fmt.Sprintf("Failed to load latest version: %v", err))
+//	}
+//
+//	// Context 생성
+//	header := cmtproto.Header{
+//		ChainID: "mychain",
+//		Height:  1,
+//		Time:    time.Now(),
+//	}
+//
+//	ctx := sdk.NewContext(ms, header, false, logger)
+//	return ctx
+//}
+
+func init() {
+	logger = initLogger()
+}
+
+func initLogger() log.Logger {
+	// Zap 로거 설정
+	zapConfig := zap.NewProductionConfig()
+	zapConfig.OutputPaths = []string{"stdout"}
+	//zapLogger, err := zapConfig.Build()
+	//if err != nil {
+	//	panic("Failed to initialize zap logger: " + err.Error())
+	//}
+
+	// Zap Logger를 io.Writer로 Wrapping
+	writer := zapcore.AddSync(os.Stdout)
+
+	// Cosmos SDK 호환 로거 생성
+	return log.NewLogger(writer)
+}
+func createContext(k ForumKeeper) sdk.Context {
+	// LevelDB 데이터베이스 생성
+	logger := initLogger()
+
+	database, err := db.NewGoLevelDB("forumdb", "./data", nil)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create LevelDB: %v", err))
+	}
+
+	// 로거 및 MultiStore 초기화
+	//logWriter := zap.NewStdLog(logger)
+	//zap.NewZapSugarLogger()
+	//logWriter := zap.NewStdLog(logger)
+	metricGatherer := metrics.NewNoOpMetrics()
+	ms := store.NewCommitMultiStore(database, logger, metricGatherer)
+
+	// Forum 스토어 키 등록
+	ms.MountStoreWithDB(k.storeKey, storetypes.StoreTypeIAVL, nil)
+
+	// MultiStore 초기화
+	if err := ms.LoadLatestVersion(); err != nil {
+		panic(fmt.Sprintf("Failed to load latest version: %v", err))
+	}
+
+	// Context 생성
+	header := cmtproto.Header{
+		ChainID: "mychain",
+		Height:  1,
+		Time:    time.Now(),
+	}
+
+	ctx := sdk.NewContext(ms, header, false, logger)
+	return ctx
+}
+
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -108,52 +198,87 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	// 클라이언트를 등록
-	mu.Lock()
-	clients[conn] = true
-	mu.Unlock()
+	// ForumKeeper 초기화
+	forumKeeper := ForumKeeper{
+		storeKey: storetypes.NewKVStoreKey("forum"),
+		cdc:      codec.NewProtoCodec(codeType.NewInterfaceRegistry()),
+	}
+	ctx := createContext(forumKeeper) // KVStore를 사용하는 Context 생성
 
-	// 연결이 닫힐 경우 클라이언트를 제거
-	defer func() {
-		mu.Lock()
-		delete(clients, conn)
-		mu.Unlock()
-	}()
-
-	//for {
-	//	// 메시지를 받아서 처리할 수 있지만 현재는 필요하지 않음
-	//	_, msg, err := conn.ReadMessage()
-	//	if err != nil {
-	//		fmt.Println("Error reading message:", err)
-	//		break
-	//	}
-	//	broadcast <- string(msg)
-	//
-	//}
 	for {
-		// 메시지를 받아서 처리 (여기서 데이터 받기)
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			fmt.Println("Error reading message:", err)
+			// 클라이언트의 연결 종료 감지
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				fmt.Printf("Unexpected WebSocket closure: %v\n", err)
+			}
 			break
 		}
 
-		var post map[string]string
-		if err := json.Unmarshal(msg, &post); err != nil {
+		var request map[string]string
+		if err := json.Unmarshal(msg, &request); err != nil {
 			fmt.Println("Error unmarshalling message:", err)
 			break
 		}
 
-		// 받은 데이터를 Keeper에 저장 (메모리 예시)
-		postID := postIDCounter
-		postIDCounter++
-		posts[postID] = post
+		action := request["action"]
+		switch action {
+		case "insert":
+			// 게시글 저장
+			title := request["title"]
+			content := request["content"]
+			author := request["author"]
 
-		// Keeper에 데이터가 저장되었는지 확인
-		fmt.Printf("Post saved: ID %d, Title: %s, Author: %s\n", postID, post["title"], post["author"])
+			post := Post{
+				ID:        time.Now().Unix(),
+				Title:     title,
+				Content:   content,
+				Author:    author,
+				Timestamp: time.Now().Unix(),
+			}
+			//logger.Info("New post created", "post", string(post))
+			fmt.Println(post.ID)
+			// KVStore에 저장
+			forumKeeper.setPost(ctx, &post)
 
-		// 저장된 데이터를 클라이언트에 broadcast
-		broadcast <- string(msg)
+			response := map[string]string{
+				"status":  "success",
+				"action":  "insert",
+				"id":      fmt.Sprintf("%d", post.ID),
+				"title":   title,
+				"content": content,
+				"author":  author,
+			}
+			conn.WriteJSON(response)
+
+		case "retrieve":
+			// 게시글 조회
+			idStr := request["id"]
+			postID, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil {
+				conn.WriteJSON(map[string]string{"error": "Invalid post ID"})
+				continue
+			}
+
+			post, found := forumKeeper.GetPost(ctx, postID)
+			if !found {
+				conn.WriteJSON(map[string]string{"error": "Post not found"})
+				continue
+			}
+
+			response := map[string]interface{}{
+				"status":  "success",
+				"action":  "retrieve",
+				"id":      post.ID,
+				"title":   post.Title,
+				"content": post.Content,
+				"author":  post.Author,
+			}
+			conn.WriteJSON(response)
+
+		default:
+			conn.WriteJSON(map[string]string{"error": "Invalid action"})
+		}
 	}
 }
 
@@ -215,52 +340,26 @@ func (k ForumKeeper) createContext() sdk.Context {
 
 	// 블록 헤더 및 로거 설정
 	// abci.Header를 사용하여 블록 헤더 생성
-	header := types.Header{
+	//header := types.Header{
+	//	ChainID: "mychain",
+	//}
+	header := cmtproto.Header{
 		ChainID: "mychain",
+		Height:  1,
+		Time:    time.Now(),
 	}
 	// Context 생성
 	ctx := sdk.NewContext(ms, header, false, logger)
 	return ctx
 }
-
-//	func (k ForumKeeper) GetPostHandler(w http.ResponseWriter, r *http.Request) {
-//		// URL에서 게시물 ID 파라미터 가져오기
-//		//id := r.URL.Query().Get("id")
-//		//if id == "" {
-//		//	http.Error(w, "Post ID is required", http.StatusBadRequest)
-//		//	return
-//		//}
-//		vars := mux.Vars(r)
-//		id := vars["id"]
-//		// 게시물 ID를 int64로 변환
-//		postID, err := strconv.ParseInt(id, 10, 64)
-//		if err != nil {
-//			http.Error(w, "Invalid post ID", http.StatusBadRequest)
-//			return
-//		}
-//
-//		// 게시물 데이터 가져오기
-//		post, found := k.GetPost(types.Context{}, postID)
-//		if !found {
-//			http.Error(w, "Post not found", http.StatusNotFound)
-//			return
-//		}
-//
-//		// 게시물 데이터를 JSON으로 응답
-//		w.Header().Set("Content-Type", "application/json")
-//		if err := json.NewEncoder(w).Encode(post); err != nil {
-//			http.Error(w, "Failed to encode post data", http.StatusInternalServerError)
-//		}
-//	}
 func main() {
-	interfaceRegistry := codeType.NewInterfaceRegistry()
 	storeKey := storetypes.NewKVStoreKey("forum")
+	interfaceRegistry := codeType.NewInterfaceRegistry()
 	cdc := codec.NewProtoCodec(interfaceRegistry)
+
 	forumKeeper := ForumKeeper{
 		storeKey: storeKey,
 		cdc:      cdc,
-		//	storeKey storetypes.StoreKey
-		//	cdc      codec.Codec
 	}
 	r := mux.NewRouter()
 
